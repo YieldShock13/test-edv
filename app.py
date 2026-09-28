@@ -1024,36 +1024,199 @@ st.markdown(
 
 
 # ============================================================
-# HISTORICAL PERIOD HELPERS
+# HISTORICAL PERIOD HELPERS — CONTROLLED NON-REINVESTED
+#
+# Return methodology:
+#
+#     (P1 - P0 + cumulative cash distributions) / P0
+#
+# Cash distributions are NOT reinvested.
+# Raw Close is used; Yahoo Adjusted Close is NOT used.
 # ============================================================
 
-def endpoint_return(
-    series,
-    start,
-    end,
+@st.cache_data(ttl=86400)
+def download_historical_reference(ticker):
+
+    hist = yf.Ticker(ticker).history(
+        start="2020-09-01",
+        interval="1d",
+        auto_adjust=False,
+        actions=True,
+        repair=False
+    ).sort_index()
+
+    if hist.empty:
+        return pd.DataFrame()
+
+    if hist.index.tz is not None:
+        hist.index = hist.index.tz_localize(None)
+
+    return hist
+
+
+def historical_price_repair(ticker, series):
+
+    s = (
+        pd.to_numeric(series, errors="coerce")
+        .astype(float)
+        .copy()
+    )
+
+    # --------------------------------------------------------
+    # STXCAP STRUCTURAL HISTORICAL REGIME
+    # Validated in historical return audit:
+    # pre-18 May 2026 observations require x100 normalization.
+    # --------------------------------------------------------
+
+    if ticker == "STXCAP.JO":
+
+        mask = (
+            s.index <
+            pd.Timestamp("2026-05-18")
+        )
+
+        s.loc[mask] = (
+            s.loc[mask] * 100.0
+        )
+
+    # --------------------------------------------------------
+    # Other isolated/regime x100 errors.
+    # Uses the same transition logic as the validated audit.
+    # --------------------------------------------------------
+
+    s = repair_100x_regimes(s, ticker)
+
+    return s
+
+
+def clean_historical_distributions(
+    ticker,
+    dividends
+):
+
+    d = (
+        pd.to_numeric(
+            dividends,
+            errors="coerce"
+        )
+        .fillna(0.0)
+    )
+
+    d = d[d > 0].copy()
+
+    if d.empty:
+        return d
+
+    # --------------------------------------------------------
+    # Validated duplicate distribution records.
+    #
+    # Yahoo contains pairs with identical cash amounts where
+    # one date is an artificial month-end record and the other
+    # is the actual distribution record.
+    #
+    # Remove ONLY the explicitly validated duplicates.
+    # --------------------------------------------------------
+
+    duplicate_dates = {
+
+        "STXCAP.JO": [
+            "2021-12-31",
+            "2022-02-28",
+            "2022-04-29",
+            "2022-06-30",
+            "2022-08-31",
+            "2022-10-31",
+            "2022-12-30",
+            "2023-02-28",
+            "2023-04-28",
+            "2023-08-31",
+            "2023-10-31",
+            "2023-12-29",
+            "2024-02-29",
+            "2024-04-30",
+            "2024-06-28",
+            "2024-08-30",
+            "2024-10-31",
+        ],
+
+        "STXGBD.JO": [
+            "2021-09-30",
+            "2022-03-31",
+            "2022-09-30",
+            "2023-03-31",
+            "2024-03-28",
+            "2024-09-30",
+        ],
+
+        "STXGOV.JO": [
+            "2022-06-30",
+            "2022-09-30",
+            "2022-12-30",
+            "2023-03-31",
+            "2023-06-30",
+            "2023-09-29",
+            "2023-12-29",
+            "2024-03-28",
+            "2024-06-28",
+            "2024-09-30",
+        ],
+    }
+
+    for dt in duplicate_dates.get(
+        ticker,
+        []
+    ):
+
+        timestamp = pd.Timestamp(dt)
+
+        if timestamp in d.index:
+            d = d.drop(timestamp)
+
+    return d
+
+
+def non_reinvested_endpoint_return(
+    ticker,
+    hist,
+    target_start,
+    target_end,
     tolerance=10
 ):
 
-    s = (
-        series
+    if hist.empty or "Close" not in hist.columns:
+        return np.nan
+
+    close = historical_price_repair(
+        ticker,
+        hist["Close"]
+    )
+
+    close = (
+        close
         .dropna()
         .sort_index()
     )
 
-    if s.empty:
+    if close.empty:
         return np.nan
 
-    starts = s[
-        (s.index >= start) &
+    # --------------------------------------------------------
+    # Require actual history around requested start.
+    # This prevents short-history securities from being given
+    # artificial 3Y/5Y results.
+    # --------------------------------------------------------
+
+    starts = close[
+        (close.index >= target_start) &
         (
-            s.index <=
-            start +
+            close.index <=
+            target_start +
             pd.Timedelta(days=tolerance)
         )
     ]
 
-    ends = s[
-        s.index <= end
+    ends = close[
+        close.index <= target_end
     ]
 
     if starts.empty or ends.empty:
@@ -1065,17 +1228,57 @@ def endpoint_return(
     if end_date <= start_date:
         return np.nan
 
-    return (
-        float(ends.iloc[-1])
-        /
-        float(starts.iloc[0])
-        - 1
+    p0 = float(
+        close.loc[start_date]
     )
 
+    p1 = float(
+        close.loc[end_date]
+    )
 
-hist_end = adj_close.index.max().normalize()
+    if (
+        not np.isfinite(p0)
+        or not np.isfinite(p1)
+        or p0 <= 0
+        or p1 <= 0
+    ):
+        return np.nan
+
+    if "Dividends" in hist.columns:
+
+        dividends = (
+            clean_historical_distributions(
+                ticker,
+                hist["Dividends"]
+            )
+        )
+
+        cash = float(
+            dividends[
+                (dividends.index > start_date) &
+                (dividends.index <= end_date)
+            ].sum()
+        )
+
+    else:
+        cash = 0.0
+
+    return (
+        p1 - p0 + cash
+    ) / p0
+
+
+# ============================================================
+# HISTORICAL END DATE
+# ============================================================
+
+hist_end = pd.Timestamp(
+    adj_close.index.max()
+).normalize()
+
 
 periods = {
+
     "M/M":
         hist_end.replace(day=1),
 
@@ -1096,29 +1299,31 @@ periods = {
 
     "5Y":
         hist_end -
-        pd.DateOffset(years=5)
+        pd.DateOffset(years=5),
 }
 
 
 # ============================================================
-# BHETNC HISTORICAL ENDPOINT PROXY
+# BHETNC HISTORICAL REFERENCE
+#
+# Yahoo BHETNC.JO history is unavailable before portfolio
+# inception, so retain the established Berkshire × USD/ZAR
+# proxy less the 1.00% annual ETN fee.
 # ============================================================
 
 @st.cache_data(ttl=86400)
 def download_bhetnc_inputs():
 
-    x = yf.download(
+    return yf.download(
         [
             "BRK-B",
             "USDZAR=X"
         ],
-        start="2020-11-20",
+        start="2020-09-01",
         interval="1d",
         auto_adjust=False,
         progress=False
     )
-
-    return x
 
 
 bh_inputs = download_bhetnc_inputs()
@@ -1138,47 +1343,15 @@ else:
     bh_adj = pd.DataFrame()
 
 
-def valid_fx_endpoint(
-    s,
-    date,
-    threshold=0.10
-):
-
-    s = s.dropna().sort_index()
-
-    if date not in s.index:
-        return False
-
-    pos = s.index.get_loc(date)
-
-    if (
-        pos == 0
-        or
-        pos == len(s) - 1
-    ):
-        return True
-
-    value = float(s.iloc[pos])
-    prev = float(s.iloc[pos - 1])
-    nxt = float(s.iloc[pos + 1])
-
-    return not (
-        abs(value / prev - 1) > threshold
-        and
-        abs(value / nxt - 1) > threshold
-    )
-
-
-def get_valid_endpoint(
+def get_proxy_endpoint(
     s,
     target,
-    tolerance=10,
-    validate_fx=False
+    tolerance=10
 ):
 
     s = s.dropna().sort_index()
 
-    candidates = s[
+    x = s[
         (s.index >= target) &
         (
             s.index <=
@@ -1187,21 +1360,13 @@ def get_valid_endpoint(
         )
     ]
 
-    for dt, value in candidates.items():
+    if x.empty:
+        return None
 
-        if (
-            validate_fx
-            and
-            not valid_fx_endpoint(
-                s,
-                dt
-            )
-        ):
-            continue
-
-        return dt, float(value)
-
-    return None
+    return (
+        x.index[0],
+        float(x.iloc[0])
+    )
 
 
 def bhetnc_return(start, end):
@@ -1209,52 +1374,45 @@ def bhetnc_return(start, end):
     if bh_adj.empty:
         return np.nan
 
-    brk = bh_adj["BRK-B"]
-    fx = bh_adj["USDZAR=X"]
-
-    bs = get_valid_endpoint(
-        brk,
+    bs = get_proxy_endpoint(
+        bh_adj["BRK-B"],
         start
     )
 
-    fs = get_valid_endpoint(
-        fx,
-        start,
-        validate_fx=True
+    fs = get_proxy_endpoint(
+        bh_adj["USDZAR=X"],
+        start
     )
 
-    be = get_valid_endpoint(
-        brk,
-        end
+    be_candidates = (
+        bh_adj["BRK-B"]
+        .dropna()
+        .loc[:end]
     )
 
-    fe = get_valid_endpoint(
-        fx,
-        end,
-        validate_fx=True
+    fe_candidates = (
+        bh_adj["USDZAR=X"]
+        .dropna()
+        .loc[:end]
     )
-
-    if any(
-        x is None
-        for x in [
-            bs,
-            fs,
-            be,
-            fe
-        ]
-    ):
-        return np.nan
 
     if (
-        abs(
-            (bs[0] - fs[0]).days
-        ) > 3
-        or
-        abs(
-            (be[0] - fe[0]).days
-        ) > 3
+        bs is None
+        or fs is None
+        or be_candidates.empty
+        or fe_candidates.empty
     ):
         return np.nan
+
+    be = (
+        be_candidates.index[-1],
+        float(be_candidates.iloc[-1])
+    )
+
+    fe = (
+        fe_candidates.index[-1],
+        float(fe_candidates.iloc[-1])
+    )
 
     years = (
         (
@@ -1265,6 +1423,9 @@ def bhetnc_return(start, end):
         /
         365.25
     )
+
+    if years <= 0:
+        return np.nan
 
     factor = (
         (be[1] / bs[1])
@@ -1292,30 +1453,37 @@ for holding, row in master.iterrows():
         "Portfolio": row["bucket"]
     }
 
-    for period, start in periods.items():
+    if ticker != "BHETNC.JO":
+
+        hist = download_historical_reference(
+            ticker
+        )
+
+    else:
+
+        hist = pd.DataFrame()
+
+    for period, period_start in periods.items():
 
         if ticker == "BHETNC.JO":
 
             result[period] = (
                 bhetnc_return(
-                    start,
-                    hist_end
-                )
-            )
-
-        elif ticker in adj_close.columns:
-
-            result[period] = (
-                endpoint_return(
-                    adj_close[ticker],
-                    start,
+                    period_start,
                     hist_end
                 )
             )
 
         else:
 
-            result[period] = np.nan
+            result[period] = (
+                non_reinvested_endpoint_return(
+                    ticker,
+                    hist,
+                    period_start,
+                    hist_end
+                )
+            )
 
     reference_rows.append(result)
 
@@ -1329,10 +1497,7 @@ reference = pd.DataFrame(
 # REFERENCE TABLE DISPLAY
 # ============================================================
 
-reference_display = (
-    reference.copy()
-)
-
+reference_display = reference.copy()
 
 for col in [
     "M/M",
@@ -1361,14 +1526,16 @@ st.dataframe(
 
 
 st.caption(
+    "Historical individual-security returns use raw price "
+    "change plus cumulative cash distributions. Cash "
+    "distributions are not reinvested. A dash indicates "
+    "insufficient history for the requested period. "
     "BHETNC historical reference returns are reconstructed "
     "from Berkshire Hathaway Class B × USD/ZAR less the "
-    "1.00% annual fee. Current/intraday BHETNC performance "
-    "uses the actual BHETNC.JO market instrument."
+    "1.00% annual fee."
 )
 
 
-# ============================================================
 # FOOTER
 # ============================================================
 
