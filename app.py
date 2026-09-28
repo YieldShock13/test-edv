@@ -2098,6 +2098,254 @@ st.caption(
 )
 
 
+
+# ============================================================
+# UPCOMING DIVIDENDS + PORTFOLIO NEWS
+#
+# Yahoo calendar/news information only.
+# This section is informational and does not feed into any
+# portfolio valuation, return, risk, or historical calculations.
+# ============================================================
+
+@st.cache_data(ttl=3600)
+def get_yahoo_portfolio_updates(tickers):
+
+    today = pd.Timestamp.now().normalize()
+
+    dividend_rows = []
+    news_rows = []
+
+    for ticker in tickers:
+
+        try:
+            stock = yf.Ticker(ticker)
+
+            # ------------------------------------------------
+            # UPCOMING EX-DIVIDEND DATE
+            # ------------------------------------------------
+
+            try:
+                calendar = stock.calendar
+
+                if isinstance(calendar, dict):
+
+                    ex_date = calendar.get(
+                        "Ex-Dividend Date"
+                    )
+
+                    if ex_date is not None:
+
+                        ex_date = pd.Timestamp(
+                            ex_date
+                        ).normalize()
+
+                        if ex_date >= today:
+
+                            dividend_rows.append(
+                                {
+                                    "Ticker": ticker,
+                                    "Ex-Dividend Date": ex_date
+                                }
+                            )
+
+            except Exception:
+                pass
+
+            # ------------------------------------------------
+            # NEWS
+            # ------------------------------------------------
+
+            try:
+                news = stock.get_news(
+                    count=3,
+                    tab="news"
+                ) or []
+
+                for item in news[:3]:
+
+                    content = item.get(
+                        "content",
+                        {}
+                    )
+
+                    title = content.get(
+                        "title"
+                    )
+
+                    pub_date = content.get(
+                        "pubDate"
+                    )
+
+                    provider = (
+                        content
+                        .get("provider", {})
+                        .get("displayName")
+                    )
+
+                    url = (
+                        content
+                        .get("clickThroughUrl", {})
+                        .get("url")
+                    )
+
+                    if not url:
+                        url = (
+                            content
+                            .get("canonicalUrl", {})
+                            .get("url")
+                        )
+
+                    if title:
+
+                        news_rows.append(
+                            {
+                                "Ticker": ticker,
+                                "Published": pub_date,
+                                "Source": provider,
+                                "Headline": title,
+                                "URL": url
+                            }
+                        )
+
+            except Exception:
+                pass
+
+        except Exception:
+            pass
+
+    return (
+        pd.DataFrame(dividend_rows),
+        pd.DataFrame(news_rows)
+    )
+
+
+portfolio_tickers = (
+    master["ticker"]
+    .dropna()
+    .astype(str)
+    .unique()
+    .tolist()
+)
+
+upcoming_dividends, portfolio_news = (
+    get_yahoo_portfolio_updates(
+        portfolio_tickers
+    )
+)
+
+
+# ============================================================
+# UPCOMING DIVIDEND CALENDAR
+# ============================================================
+
+st.subheader(
+    "Upcoming Dividend Calendar"
+)
+
+if not upcoming_dividends.empty:
+
+    upcoming_dividends = (
+        upcoming_dividends
+        .drop_duplicates()
+        .sort_values("Ex-Dividend Date")
+        .reset_index(drop=True)
+    )
+
+    upcoming_dividends[
+        "Ex-Dividend Date"
+    ] = (
+        upcoming_dividends[
+            "Ex-Dividend Date"
+        ]
+        .dt.strftime("%d %b %Y")
+    )
+
+    st.dataframe(
+        upcoming_dividends,
+        use_container_width=True,
+        hide_index=True
+    )
+
+else:
+
+    st.caption(
+        "No upcoming ex-dividend dates are currently "
+        "available from Yahoo Finance."
+    )
+
+st.caption(
+    "Only future ex-dividend dates explicitly supplied by "
+    "Yahoo Finance are shown. No dividend dates or amounts "
+    "are estimated."
+)
+
+
+# ============================================================
+# PORTFOLIO NEWS
+# ============================================================
+
+st.subheader(
+    "Portfolio News"
+)
+
+if not portfolio_news.empty:
+
+    portfolio_news[
+        "Published"
+    ] = pd.to_datetime(
+        portfolio_news["Published"],
+        errors="coerce",
+        utc=True
+    )
+
+    portfolio_news = (
+        portfolio_news
+        .drop_duplicates(
+            subset=["Headline"]
+        )
+        .sort_values(
+            "Published",
+            ascending=False
+        )
+        .reset_index(drop=True)
+    )
+
+    portfolio_news[
+        "Published"
+    ] = (
+        portfolio_news[
+            "Published"
+        ]
+        .dt.strftime(
+            "%d %b %Y %H:%M UTC"
+        )
+    )
+
+    st.dataframe(
+        portfolio_news,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "URL":
+                st.column_config.LinkColumn(
+                    "Article"
+                )
+        }
+    )
+
+else:
+
+    st.caption(
+        "No portfolio news is currently available "
+        "from Yahoo Finance."
+    )
+
+st.caption(
+    "News is supplied by Yahoo Finance and its underlying "
+    "publishers. Headlines are informational only."
+)
+
+
 # FOOTER
 # ============================================================
 
