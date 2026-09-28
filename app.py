@@ -1005,29 +1005,54 @@ else:
     )
 
     # --------------------------------------------
-    # Win / Loss %
+    # Win / Loss Ratio
     #
-    # Zero-return days are neither wins nor losses.
-    # Percentages use all valid portfolio days as
-    # denominator.
+    # Number of positive-return days divided by
+    # number of negative-return days.
+    # Zero-return days are excluded.
     # --------------------------------------------
 
-    if len(r) >= 1:
+    wins = int(
+        (r > 0).sum()
+    )
 
-        win_pct = float(
-            (r > 0).sum()
-            / len(r)
+    losses = int(
+        (r < 0).sum()
+    )
+
+    win_loss_ratio = (
+        wins / losses
+        if losses > 0
+        else np.nan
+    )
+
+    # --------------------------------------------
+    # Historical 95% One-Day Value-at-Risk
+    #
+    # Negative of the empirical 5th percentile of
+    # official daily portfolio returns, displayed
+    # as a positive loss magnitude.
+    #
+    # Minimum 20 observations before reporting.
+    # --------------------------------------------
+
+    if len(r) >= 20:
+
+        var_95_raw = float(
+            np.quantile(
+                r,
+                0.05
+            )
         )
 
-        loss_pct = float(
-            (r < 0).sum()
-            / len(r)
+        var_95 = max(
+            0.0,
+            -var_95_raw
         )
 
     else:
 
-        win_pct = np.nan
-        loss_pct = np.nan
+        var_95 = np.nan
 
     # --------------------------------------------
     # Annualised portfolio return + Sharpe
@@ -1284,13 +1309,13 @@ else:
     )
 
     metric_row_3[1].metric(
-        "Win %",
-        pct_or_dash(win_pct)
+        "Win/Loss Ratio",
+        num_or_dash(win_loss_ratio)
     )
 
     metric_row_3[2].metric(
-        "Loss %",
-        pct_or_dash(loss_pct)
+        "95% Daily VaR",
+        pct_or_dash(var_95)
     )
 
     st.caption(
