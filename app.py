@@ -1027,20 +1027,20 @@ else:
     )
 
     # --------------------------------------------
-    # Historical 95% One-Day Value-at-Risk
+    # Historical 95% Weekly Value-at-Risk
     #
     # Negative of the empirical 5th percentile of
-    # official daily portfolio returns, displayed
-    # as a positive loss magnitude.
+    # actual compounded weekly portfolio returns,
+    # displayed as a positive loss magnitude.
     #
-    # Minimum 20 observations before reporting.
+    # Minimum 20 weekly observations before reporting.
     # --------------------------------------------
 
-    if len(r) >= 20:
+    if len(weekly_returns) >= 20:
 
         var_95_raw = float(
             np.quantile(
-                r,
+                weekly_returns,
                 0.05
             )
         )
@@ -1314,7 +1314,7 @@ else:
     )
 
     metric_row_3[2].metric(
-        "95% Daily VaR",
+        "95% Weekly VaR",
         pct_or_dash(var_95)
     )
 
