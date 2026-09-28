@@ -1,0 +1,51 @@
+name: Daily Portfolio EOD
+
+on:
+  schedule:
+    # 15:30 UTC = 17:30 South Africa time
+    # Runs Mon-Fri. eod_update.py itself must validate market data.
+    - cron: "30 15 * * 1-5"
+
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update-portfolio:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run official EOD update
+        run: python eod_update.py
+
+      - name: Validate generated files
+        run: |
+          test -f portfolio_history.csv
+          test -f portfolio_basis.csv
+          echo "EOD files successfully generated."
+
+      - name: Commit EOD state
+        run: |
+          git config user.name "portfolio-eod-bot"
+          git config user.email "portfolio-eod-bot@users.noreply.github.com"
+
+          git add portfolio_history.csv portfolio_basis.csv
+
+          if git diff --cached --quiet; then
+            echo "No EOD changes to commit."
+          else
+            git commit -m "Update portfolio EOD state"
+            git push
+          fi
