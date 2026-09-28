@@ -671,6 +671,217 @@ history.to_csv(
 )
 
 
+
+# ============================================================
+# RETURN COMPOSITION HISTORY
+#
+# Separate audit/display dataset only.
+#
+# Uses the SAME security-level P&L and SAME opening-capital
+# denominator already used by the official portfolio return.
+#
+# Price contribution + income contribution must therefore
+# equal the existing official daily portfolio return.
+#
+# This does NOT modify portfolio_history.csv or the official
+# portfolio-return calculation.
+# ============================================================
+
+COMPOSITION_FILE = Path(
+    "portfolio_return_composition.csv"
+)
+
+
+def calc_return_composition(df):
+
+    capital = float(
+        df["Opening_Value"].sum()
+    )
+
+    price_pnl = float(
+        df["Price_PnL"].sum()
+    )
+
+    income_pnl = float(
+        df["Dividend_Cash"].sum()
+    )
+
+    if capital <= 0:
+        return np.nan, np.nan
+
+    return (
+        price_pnl / capital,
+        income_pnl / capital
+    )
+
+
+combined_price, combined_income = (
+    calc_return_composition(
+        detail
+    )
+)
+
+main_price, main_income = (
+    calc_return_composition(
+        detail[
+            detail["Bucket"] == "Main"
+        ]
+    )
+)
+
+subset_price, subset_income = (
+    calc_return_composition(
+        detail[
+            detail["Bucket"] == "Subset"
+        ]
+    )
+)
+
+
+# ------------------------------------------------------------
+# HARD RECONCILIATION CONTROL
+#
+# Do not write anything if the decomposition does not reproduce
+# the already-calculated official daily portfolio return.
+# ------------------------------------------------------------
+
+composition_checks = [
+    (
+        "Combined",
+        combined_price + combined_income,
+        combined_return
+    ),
+    (
+        "Main",
+        main_price + main_income,
+        main_return
+    ),
+    (
+        "Subset",
+        subset_price + subset_income,
+        subset_return
+    ),
+]
+
+for (
+    portfolio_name,
+    decomposed_return,
+    official_return
+) in composition_checks:
+
+    if not np.isclose(
+        decomposed_return,
+        official_return,
+        rtol=0.0,
+        atol=1e-12
+    ):
+        raise RuntimeError(
+            "STOP — return-composition reconciliation failed "
+            f"for {portfolio_name}. "
+            f"Decomposed={decomposed_return:.12f}, "
+            f"Official={official_return:.12f}"
+        )
+
+
+composition_row = pd.DataFrame([{
+    "Date": current_date,
+
+    "Combined_Price":
+        combined_price,
+
+    "Combined_Income":
+        combined_income,
+
+    "Main_Price":
+        main_price,
+
+    "Main_Income":
+        main_income,
+
+    "Subset_Price":
+        subset_price,
+
+    "Subset_Income":
+        subset_income,
+}])
+
+
+if COMPOSITION_FILE.exists():
+
+    composition_history = pd.read_csv(
+        COMPOSITION_FILE,
+        parse_dates=["Date"]
+    )
+
+    composition_history = pd.concat(
+        [
+            composition_history,
+            composition_row
+        ],
+        ignore_index=True
+    )
+
+else:
+
+    composition_history = (
+        composition_row.copy()
+    )
+
+
+composition_history = (
+    composition_history[
+        composition_history["Date"]
+        >= PORTFOLIO_START
+    ]
+    .sort_values("Date")
+    .drop_duplicates(
+        subset=["Date"],
+        keep="last"
+    )
+    .reset_index(drop=True)
+)
+
+
+composition_history.to_csv(
+    COMPOSITION_FILE,
+    index=False
+)
+
+
+print()
+print("=" * 90)
+print("RETURN COMPOSITION")
+print("=" * 90)
+
+print(
+    f"Combined: Price {combined_price:+.4%} | "
+    f"Income {combined_income:+.4%} | "
+    f"Total {(combined_price + combined_income):+.4%}"
+)
+
+print(
+    f"Main:     Price {main_price:+.4%} | "
+    f"Income {main_income:+.4%} | "
+    f"Total {(main_price + main_income):+.4%}"
+)
+
+print(
+    f"Subset:   Price {subset_price:+.4%} | "
+    f"Income {subset_income:+.4%} | "
+    f"Total {(subset_price + subset_income):+.4%}"
+)
+
+print()
+print(
+    "PASS — composition reconciles exactly to "
+    "official daily portfolio returns."
+)
+
+print(
+    "portfolio_return_composition.csv updated successfully."
+)
+
+
 # ============================================================
 # CUMULATIVE PROGRESSION RETURN
 #

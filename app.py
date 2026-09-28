@@ -805,6 +805,182 @@ else:
 
 
     # ========================================================
+    # RETURN COMPOSITION — FROM INCEPTION
+    #
+    # Read-only display using the separate composition history.
+    # Daily price and income contributions are linked through
+    # the official portfolio NAV path so that:
+    #
+    # Capital Gains + Income = official cumulative return.
+    #
+    # Nothing here modifies portfolio returns or stored data.
+    # ========================================================
+
+    composition_file = Path(
+        "portfolio_return_composition.csv"
+    )
+
+    if composition_file.exists():
+
+        composition = pd.read_csv(
+            composition_file,
+            parse_dates=["Date"]
+        )
+
+        composition = (
+            composition[
+                composition["Date"]
+                >= PORTFOLIO_START
+            ]
+            .sort_values("Date")
+            .drop_duplicates(
+                subset=["Date"],
+                keep="last"
+            )
+            .reset_index(drop=True)
+        )
+
+        price_col = (
+            f"{selected}_Price"
+        )
+
+        income_col = (
+            f"{selected}_Income"
+        )
+
+        if (
+            price_col in composition.columns
+            and income_col in composition.columns
+        ):
+
+            linked = (
+                nav[
+                    ["Date", selected]
+                ]
+                .merge(
+                    composition[
+                        [
+                            "Date",
+                            price_col,
+                            income_col
+                        ]
+                    ],
+                    on="Date",
+                    how="inner"
+                )
+                .sort_values("Date")
+                .reset_index(drop=True)
+            )
+
+            if not linked.empty:
+
+                daily_total = pd.to_numeric(
+                    linked[selected],
+                    errors="coerce"
+                )
+
+                daily_price = pd.to_numeric(
+                    linked[price_col],
+                    errors="coerce"
+                )
+
+                daily_income = pd.to_numeric(
+                    linked[income_col],
+                    errors="coerce"
+                )
+
+                valid = (
+                    daily_total.notna()
+                    & daily_price.notna()
+                    & daily_income.notna()
+                )
+
+                linked = linked.loc[
+                    valid
+                ].reset_index(drop=True)
+
+                daily_total = daily_total.loc[
+                    valid
+                ].reset_index(drop=True)
+
+                daily_price = daily_price.loc[
+                    valid
+                ].reset_index(drop=True)
+
+                daily_income = daily_income.loc[
+                    valid
+                ].reset_index(drop=True)
+
+                if not linked.empty:
+
+                    nav_entering_day = (
+                        (1.0 + daily_total)
+                        .cumprod()
+                        .shift(1)
+                        .fillna(1.0)
+                    )
+
+                    capital_gain_contribution = float(
+                        (
+                            nav_entering_day
+                            * daily_price
+                        ).sum()
+                    )
+
+                    income_contribution = float(
+                        (
+                            nav_entering_day
+                            * daily_income
+                        ).sum()
+                    )
+
+                    linked_total = (
+                        capital_gain_contribution
+                        + income_contribution
+                    )
+
+                    official_cumulative = float(
+                        (1.0 + daily_total).prod()
+                        - 1.0
+                    )
+
+                    if not np.isclose(
+                        linked_total,
+                        official_cumulative,
+                        rtol=0.0,
+                        atol=1e-12
+                    ):
+                        raise RuntimeError(
+                            "Return-composition display "
+                            "does not reconcile to official "
+                            "cumulative portfolio return."
+                        )
+
+                    st.markdown(
+                        "**Return Composition**"
+                    )
+
+                    composition_cols = (
+                        st.columns(3)
+                    )
+
+                    composition_cols[0].metric(
+                        "Capital Gains",
+                        f"{capital_gain_contribution:+.2%}"
+                    )
+
+                    composition_cols[1].metric(
+                        "Income",
+                        f"{income_contribution:+.2%}"
+                    )
+
+                    composition_cols[2].metric(
+                        "Total Return",
+                        f"{official_cumulative:+.2%}"
+                    )
+
+
+    # ========================================================
     # PORTFOLIO ANALYTICS — FROM INCEPTION
     #
     # Calculated ONLY from official daily portfolio returns
