@@ -803,6 +803,503 @@ else:
     )
 
 
+
+    # ========================================================
+    # PORTFOLIO ANALYTICS — FROM INCEPTION
+    #
+    # Calculated ONLY from official daily portfolio returns
+    # stored in portfolio_history.csv.
+    #
+    # Benchmark analytics use STXCAP.JO on matching dates.
+    # Nothing here modifies the official portfolio track record.
+    # ========================================================
+
+    RF_ANNUAL = 0.0725
+    TRADING_DAYS = 252
+    WEEKS_PER_YEAR = 52
+
+    r = (
+        pd.to_numeric(
+            nav[selected],
+            errors="coerce"
+        )
+        .dropna()
+    )
+
+    # --------------------------------------------
+    # Safe display helpers
+    # --------------------------------------------
+
+    def pct_or_dash(x):
+        return (
+            "–"
+            if x is None or not np.isfinite(x)
+            else f"{x:+.2%}"
+        )
+
+    def num_or_dash(x):
+        return (
+            "–"
+            if x is None or not np.isfinite(x)
+            else f"{x:.2f}"
+        )
+
+    def days_or_dash(x):
+        return (
+            "–"
+            if x is None or not np.isfinite(x)
+            else f"{int(x)}"
+        )
+
+    # --------------------------------------------
+    # Cumulative return
+    # --------------------------------------------
+
+    cumulative_return = (
+        (1.0 + r).prod() - 1.0
+        if len(r) >= 1
+        else np.nan
+    )
+
+    # --------------------------------------------
+    # Daily annualised volatility
+    # --------------------------------------------
+
+    annualised_vol = (
+        r.std(ddof=1)
+        * np.sqrt(TRADING_DAYS)
+        if len(r) >= 2
+        else np.nan
+    )
+
+    # --------------------------------------------
+    # Weekly annualised volatility
+    #
+    # Compound official daily observations into
+    # calendar weeks, then annualise weekly sigma.
+    # --------------------------------------------
+
+    weekly_frame = (
+        nav[["Date", selected]]
+        .dropna()
+        .set_index("Date")
+        .sort_index()
+    )
+
+    weekly_returns = (
+        (1.0 + weekly_frame[selected])
+        .resample("W-FRI")
+        .prod()
+        - 1.0
+    )
+
+    # Do not count an empty resampled week.
+    weekly_counts = (
+        weekly_frame[selected]
+        .resample("W-FRI")
+        .count()
+    )
+
+    weekly_returns = weekly_returns[
+        weekly_counts > 0
+    ]
+
+    weekly_vol = (
+        weekly_returns.std(ddof=1)
+        * np.sqrt(WEEKS_PER_YEAR)
+        if len(weekly_returns) >= 2
+        else np.nan
+    )
+
+    # --------------------------------------------
+    # Drawdown and recovery
+    # --------------------------------------------
+
+    if len(r) >= 1:
+
+        nav_index = (
+            (1.0 + r)
+            .cumprod()
+        )
+
+        running_peak = (
+            nav_index.cummax()
+        )
+
+        drawdown = (
+            nav_index / running_peak
+            - 1.0
+        )
+
+        max_drawdown = float(
+            drawdown.min()
+        )
+
+        trough_label = (
+            drawdown.idxmin()
+        )
+
+        trough_pos = (
+            list(nav_index.index)
+            .index(trough_label)
+        )
+
+        peak_value = float(
+            running_peak.loc[
+                trough_label
+            ]
+        )
+
+        post_trough = (
+            nav_index.iloc[
+                trough_pos + 1:
+            ]
+        )
+
+        recovered = (
+            post_trough[
+                post_trough >= peak_value
+            ]
+        )
+
+        if (
+            max_drawdown < 0
+            and not recovered.empty
+        ):
+
+            recovery_label = (
+                recovered.index[0]
+            )
+
+            recovery_pos = (
+                list(nav_index.index)
+                .index(recovery_label)
+            )
+
+            days_to_recover = (
+                recovery_pos
+                - trough_pos
+            )
+
+        else:
+            days_to_recover = np.nan
+
+    else:
+
+        max_drawdown = np.nan
+        days_to_recover = np.nan
+
+    # --------------------------------------------
+    # Maximum upside
+    # Largest positive official daily return.
+    # --------------------------------------------
+
+    positive_days = r[r > 0]
+
+    max_upside = (
+        float(positive_days.max())
+        if not positive_days.empty
+        else np.nan
+    )
+
+    # --------------------------------------------
+    # Win / Loss %
+    #
+    # Zero-return days are neither wins nor losses.
+    # Percentages use all valid portfolio days as
+    # denominator.
+    # --------------------------------------------
+
+    if len(r) >= 1:
+
+        win_pct = float(
+            (r > 0).sum()
+            / len(r)
+        )
+
+        loss_pct = float(
+            (r < 0).sum()
+            / len(r)
+        )
+
+    else:
+
+        win_pct = np.nan
+        loss_pct = np.nan
+
+    # --------------------------------------------
+    # Annualised portfolio return + Sharpe
+    #
+    # Geometric annualisation of actual official
+    # daily observations from inception.
+    # --------------------------------------------
+
+    if len(r) >= 2:
+
+        growth = float(
+            (1.0 + r).prod()
+        )
+
+        annualised_return = (
+            growth ** (
+                TRADING_DAYS
+                / len(r)
+            )
+            - 1.0
+        )
+
+    else:
+        annualised_return = np.nan
+
+    sharpe = (
+        (
+            annualised_return
+            - RF_ANNUAL
+        )
+        / annualised_vol
+        if (
+            np.isfinite(annualised_return)
+            and np.isfinite(annualised_vol)
+            and annualised_vol > 0
+        )
+        else np.nan
+    )
+
+    # --------------------------------------------
+    # STXCAP benchmark for Beta / Alpha
+    #
+    # Downloaded independently for analytics only.
+    # Does NOT alter portfolio_history.csv.
+    # --------------------------------------------
+
+    beta = np.nan
+    alpha = np.nan
+
+    if len(nav) >= 2:
+
+        benchmark_start = (
+            nav["Date"].min()
+            - pd.Timedelta(days=7)
+        )
+
+        benchmark_end = (
+            nav["Date"].max()
+            + pd.Timedelta(days=2)
+        )
+
+        try:
+
+            benchmark_hist = (
+                yf.Ticker("STXCAP.JO")
+                .history(
+                    start=benchmark_start,
+                    end=benchmark_end,
+                    interval="1d",
+                    auto_adjust=False,
+                    actions=False,
+                    repair=False
+                )
+            )
+
+            if not benchmark_hist.empty:
+
+                if benchmark_hist.index.tz is not None:
+                    benchmark_hist.index = (
+                        benchmark_hist.index
+                        .tz_localize(None)
+                    )
+
+                benchmark_close = (
+                    pd.to_numeric(
+                        benchmark_hist["Close"],
+                        errors="coerce"
+                    )
+                    .dropna()
+                    .sort_index()
+                )
+
+                # Apply same validated STXCAP
+                # structural price normalization.
+                benchmark_close = (
+                    historical_price_repair(
+                        "STXCAP.JO",
+                        benchmark_close
+                    )
+                )
+
+                benchmark_return = (
+                    benchmark_close
+                    .pct_change()
+                    .dropna()
+                    .rename("Benchmark")
+                )
+
+                portfolio_for_beta = (
+                    nav[
+                        ["Date", selected]
+                    ]
+                    .copy()
+                    .rename(
+                        columns={
+                            selected:
+                            "Portfolio"
+                        }
+                    )
+                    .set_index("Date")
+                )
+
+                aligned = (
+                    portfolio_for_beta
+                    .join(
+                        benchmark_return,
+                        how="inner"
+                    )
+                    .dropna()
+                )
+
+                # Need enough aligned observations
+                # and non-zero benchmark variance.
+                if (
+                    len(aligned) >= 2
+                    and
+                    aligned["Benchmark"]
+                    .var(ddof=1) > 0
+                ):
+
+                    beta = float(
+                        aligned[
+                            ["Portfolio",
+                             "Benchmark"]
+                        ]
+                        .cov()
+                        .loc[
+                            "Portfolio",
+                            "Benchmark"
+                        ]
+                        /
+                        aligned[
+                            "Benchmark"
+                        ]
+                        .var(ddof=1)
+                    )
+
+                    rf_daily = (
+                        (1.0 + RF_ANNUAL)
+                        ** (1.0 / TRADING_DAYS)
+                        - 1.0
+                    )
+
+                    portfolio_excess = (
+                        aligned["Portfolio"]
+                        - rf_daily
+                    )
+
+                    benchmark_excess = (
+                        aligned["Benchmark"]
+                        - rf_daily
+                    )
+
+                    alpha_daily = float(
+                        portfolio_excess.mean()
+                        -
+                        beta
+                        * benchmark_excess.mean()
+                    )
+
+                    # Geometric annualisation of
+                    # estimated daily CAPM alpha.
+                    if alpha_daily > -1:
+
+                        alpha = (
+                            (1.0 + alpha_daily)
+                            ** TRADING_DAYS
+                            - 1.0
+                        )
+
+        except Exception:
+            # Analytics must never break the
+            # official portfolio dashboard.
+            beta = np.nan
+            alpha = np.nan
+
+    # --------------------------------------------
+    # DISPLAY
+    # --------------------------------------------
+
+    st.markdown(
+        "#### Performance & Risk Since Inception"
+    )
+
+    metric_row_1 = st.columns(4)
+
+    metric_row_1[0].metric(
+        "Cumulative Return",
+        pct_or_dash(cumulative_return)
+    )
+
+    metric_row_1[1].metric(
+        "Annualised Volatility",
+        pct_or_dash(annualised_vol)
+    )
+
+    metric_row_1[2].metric(
+        "Weekly Volatility",
+        pct_or_dash(weekly_vol)
+    )
+
+    metric_row_1[3].metric(
+        "Maximum Drawdown",
+        pct_or_dash(max_drawdown)
+    )
+
+    metric_row_2 = st.columns(4)
+
+    metric_row_2[0].metric(
+        "Maximum Upside",
+        pct_or_dash(max_upside)
+    )
+
+    metric_row_2[1].metric(
+        "Days to Recover",
+        days_or_dash(days_to_recover)
+    )
+
+    metric_row_2[2].metric(
+        "Beta vs STXCAP",
+        num_or_dash(beta)
+    )
+
+    metric_row_2[3].metric(
+        "Alpha",
+        pct_or_dash(alpha)
+    )
+
+    metric_row_3 = st.columns(3)
+
+    metric_row_3[0].metric(
+        "Sharpe Ratio",
+        num_or_dash(sharpe)
+    )
+
+    metric_row_3[1].metric(
+        "Win %",
+        pct_or_dash(win_pct)
+    )
+
+    metric_row_3[2].metric(
+        "Loss %",
+        pct_or_dash(loss_pct)
+    )
+
+    st.caption(
+        "Statistics use official portfolio observations from "
+        "28 September 2026 onward. Volatility is annualised "
+        "from daily or weekly returns as labelled. Beta and "
+        "CAPM alpha use STXCAP as benchmark and a 7.25% "
+        "annual risk-free rate."
+    )
+
+
     # ========================================================
     # DAILY RETURN HISTORY
     # ========================================================
