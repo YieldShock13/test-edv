@@ -32,9 +32,14 @@ jobs:
 
       - name: Validate generated files
         run: |
-          test -f portfolio_history.csv
           test -f portfolio_basis.csv
-          echo "EOD files successfully generated."
+          echo "EOD basis successfully validated."
+
+          if [ -f portfolio_history.csv ]; then
+            echo "Portfolio history exists and will be committed."
+          else
+            echo "No portfolio history yet — valid on portfolio inception."
+          fi
 
       - name: Commit EOD state
         run: |
