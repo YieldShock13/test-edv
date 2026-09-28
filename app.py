@@ -1054,6 +1054,44 @@ def download_historical_reference(ticker):
     return hist
 
 
+
+def repair_100x_regimes(series, ticker):
+
+    s = series.copy().astype(float)
+
+    if len(s) < 2:
+        return s
+
+    scale = 1.0
+    repaired = s.copy()
+
+    for i in range(1, len(s)):
+
+        raw_prev = s.iloc[i - 1]
+        raw_curr = s.iloc[i]
+
+        if (
+            not np.isfinite(raw_prev)
+            or not np.isfinite(raw_curr)
+            or raw_prev <= 0
+            or raw_curr <= 0
+        ):
+            repaired.iloc[i] = raw_curr * scale
+            continue
+
+        raw_ratio = raw_curr / raw_prev
+
+        if 0.005 <= raw_ratio <= 0.02:
+            scale *= 100.0
+
+        elif 50 <= raw_ratio <= 200:
+            scale /= 100.0
+
+        repaired.iloc[i] = raw_curr * scale
+
+    return repaired
+
+
 def historical_price_repair(ticker, series):
 
     s = (
