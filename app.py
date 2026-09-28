@@ -26,6 +26,7 @@ NOW = datetime.now(SAST)
 
 PORTFOLIO_START = pd.Timestamp("2026-09-28")
 NAV_FILE = Path("portfolio_history.csv")
+BASIS_FILE = Path("portfolio_basis.csv")
 
 
 # ============================================================
@@ -355,7 +356,46 @@ for ticker in adj_close.columns:
 
 # ============================================================
 # LIVE PERFORMANCE
+#
+# RULE:
+# If an official EOD basis exists from a PRIOR trading date,
+# today's ordinary intraday market price is compared against
+# that persisted Adjusted-Close basis.
+#
+# On portfolio inception day only, before the first EOD basis
+# exists, fall back to the prior ordinary market close.
 # ============================================================
+
+basis = pd.DataFrame()
+
+if BASIS_FILE.exists():
+
+    basis = pd.read_csv(
+        BASIS_FILE,
+        parse_dates=["Date"]
+    )
+
+    required_basis_cols = {
+        "Date",
+        "Holding",
+        "Ticker",
+        "Bucket",
+        "Qty",
+        "Adjusted_Basis"
+    }
+
+    missing_cols = required_basis_cols - set(basis.columns)
+
+    if missing_cols:
+        raise RuntimeError(
+            "Invalid portfolio_basis.csv. Missing: "
+            + ", ".join(sorted(missing_cols))
+        )
+
+    basis["Date"] = pd.to_datetime(
+        basis["Date"]
+    ).dt.normalize()
+
 
 live_rows = []
 
@@ -373,55 +413,147 @@ for holding, row in master.iterrows():
     if s.empty:
         continue
 
-    # Yahoo timestamps
     idx = s.index
 
     if idx.tz is None:
         idx = idx.tz_localize("UTC")
 
-    local_dates = idx.tz_convert(SAST).date
+    local_idx = idx.tz_convert(SAST)
+    local_dates = local_idx.date
 
     unique_dates = sorted(set(local_dates))
 
-    if len(unique_dates) < 2:
+    if not unique_dates:
         continue
 
     today = unique_dates[-1]
-    prior_day = unique_dates[-2]
 
-    today_mask = local_dates == today
-    prior_mask = local_dates == prior_day
+    today_positions = np.where(
+        local_dates == today
+    )[0]
 
-    today_s = s.iloc[np.where(today_mask)[0]]
-    prior_s = s.iloc[np.where(prior_mask)[0]]
-
-    if today_s.empty or prior_s.empty:
+    if len(today_positions) == 0:
         continue
 
+    today_s = s.iloc[today_positions]
+
     latest_raw = float(today_s.iloc[-1])
-    prior_raw = float(prior_s.iloc[-1])
 
-    # JSE Yahoo quotes are generally in cents.
+    # Yahoo JSE intraday quote in cents -> rand
     latest_price = latest_raw / 100
-    prior_price = prior_raw / 100
 
-    ret = latest_price / prior_price - 1
+    basis_price = np.nan
+    basis_date = None
+    basis_source = None
 
-    opening_value = qty * prior_price
-    current_value = qty * latest_price
+    # --------------------------------------------------------
+    # PRIMARY METHOD:
+    # persisted previous EOD Adjusted Close
+    # --------------------------------------------------------
 
-    pnl = current_value - opening_value
+    if not basis.empty:
 
-    timestamp = idx[np.where(today_mask)[0][-1]]
+        b = basis[
+            basis["Ticker"] == ticker
+        ].copy()
 
-    timestamp = timestamp.tz_convert(SAST)
+        if not b.empty:
+
+            # Only use a basis strictly earlier than today.
+            b = b[
+                b["Date"].dt.date < today
+            ]
+
+            if not b.empty:
+
+                b = b.sort_values("Date").iloc[-1]
+
+                basis_price = float(
+                    b["Adjusted_Basis"]
+                )
+
+                basis_date = pd.Timestamp(
+                    b["Date"]
+                )
+
+                basis_source = (
+                    "Prior EOD Adjusted Close"
+                )
+
+    # --------------------------------------------------------
+    # INCEPTION-DAY FALLBACK ONLY:
+    # prior ordinary market close.
+    # Once portfolio_basis.csv exists, this should no longer
+    # be needed on subsequent trading days.
+    # --------------------------------------------------------
+
+    if pd.isna(basis_price):
+
+        prior_dates = [
+            d for d in unique_dates
+            if d < today
+        ]
+
+        if not prior_dates:
+            continue
+
+        prior_day = prior_dates[-1]
+
+        prior_positions = np.where(
+            local_dates == prior_day
+        )[0]
+
+        prior_s = s.iloc[
+            prior_positions
+        ]
+
+        if prior_s.empty:
+            continue
+
+        basis_price = (
+            float(prior_s.iloc[-1]) / 100
+        )
+
+        basis_date = pd.Timestamp(
+            prior_day
+        )
+
+        basis_source = (
+            "Prior ordinary close "
+            "(inception fallback)"
+        )
+
+    if basis_price <= 0:
+        continue
+
+    ret = (
+        latest_price / basis_price - 1
+    )
+
+    opening_value = (
+        qty * basis_price
+    )
+
+    current_value = (
+        qty * latest_price
+    )
+
+    pnl = (
+        current_value - opening_value
+    )
+
+    timestamp = local_idx[
+        today_positions[-1]
+    ]
 
     live_rows.append({
         "Holding": holding,
         "Ticker": ticker,
         "Bucket": bucket,
         "Qty": qty,
-        "Prior_Close": prior_price,
+        "Prior_Close": basis_price,
+        "Basis_Date": basis_date,
+        "Basis_Source": basis_source,
         "Latest": latest_price,
         "Today_Return": ret,
         "Opening_Value": opening_value,
@@ -432,7 +564,6 @@ for holding, row in master.iterrows():
 
 
 live = pd.DataFrame(live_rows)
-
 
 # ============================================================
 # PORTFOLIO SUMMARY

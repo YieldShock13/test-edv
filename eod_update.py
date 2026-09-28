@@ -10,6 +10,7 @@ SAST = ZoneInfo("Africa/Johannesburg")
 
 PORTFOLIO_START = pd.Timestamp("2026-09-28")
 NAV_FILE = Path("portfolio_history.csv")
+BASIS_FILE = Path("portfolio_basis.csv")
 
 
 # ============================================================
@@ -226,6 +227,61 @@ print()
 print("These are Adjusted-Close total returns.")
 print()
 
+
+
+# ============================================================
+# SAVE OFFICIAL EOD BASIS FOR NEXT TRADING DAY
+#
+# This is the ONLY basis used by tomorrow's live dashboard.
+# Adjusted Close captures distributions / corporate actions.
+# ============================================================
+
+basis_rows = []
+
+for _, h in holdings.iterrows():
+
+    ticker = h["Ticker"]
+
+    curr_adj = adj.loc[current_date, ticker]
+
+    if pd.isna(curr_adj):
+        raise RuntimeError(
+            f"STOP — no EOD adjusted close for {ticker}"
+        )
+
+    # Yahoo JSE instruments are quoted in cents.
+    basis_price = float(curr_adj / 100)
+
+    basis_rows.append({
+        "Date": current_date,
+        "Holding": h["Holding"],
+        "Ticker": ticker,
+        "Bucket": h["Bucket"],
+        "Qty": float(h["Qty"]),
+        "Adjusted_Basis": basis_price
+    })
+
+
+basis = pd.DataFrame(basis_rows)
+
+if len(basis) != len(holdings):
+    raise RuntimeError(
+        "STOP — EOD basis does not contain every holding."
+    )
+
+basis.to_csv(
+    BASIS_FILE,
+    index=False
+)
+
+print()
+print("Official next-day basis saved:")
+print(BASIS_FILE)
+print(
+    f"Basis date: {current_date.date()} | "
+    f"Holdings: {len(basis)}"
+)
+print()
 
 # ============================================================
 # SAVE / UPDATE HISTORY
