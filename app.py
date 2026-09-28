@@ -360,7 +360,7 @@ for ticker in adj_close.columns:
 # RULE:
 # If an official EOD basis exists from a PRIOR trading date,
 # today's ordinary intraday market price is compared against
-# that persisted Adjusted-Close basis.
+# that persisted ordinary EOD Close basis.
 #
 # On portfolio inception day only, before the first EOD basis
 # exists, fall back to the prior ordinary market close.
@@ -381,7 +381,7 @@ if BASIS_FILE.exists():
         "Ticker",
         "Bucket",
         "Qty",
-        "Adjusted_Basis"
+        "Price_Basis"
     }
 
     missing_cols = required_basis_cols - set(basis.columns)
@@ -448,7 +448,7 @@ for holding, row in master.iterrows():
 
     # --------------------------------------------------------
     # PRIMARY METHOD:
-    # persisted previous EOD Adjusted Close
+    # persisted previous ordinary EOD Close
     # --------------------------------------------------------
 
     if not basis.empty:
@@ -469,7 +469,7 @@ for holding, row in master.iterrows():
                 b = b.sort_values("Date").iloc[-1]
 
                 basis_price = float(
-                    b["Adjusted_Basis"]
+                    b["Price_Basis"]
                 )
 
                 basis_date = pd.Timestamp(
@@ -477,7 +477,7 @@ for holding, row in master.iterrows():
                 )
 
                 basis_source = (
-                    "Prior EOD Adjusted Close"
+                    "Prior EOD ordinary Close"
                 )
 
     # --------------------------------------------------------
@@ -638,9 +638,10 @@ st.subheader("Live / Intraday Estimate")
 st.markdown(
     """
     <div class="section-note">
-    Ordinary intraday prices versus previous market close.
-    Official daily portfolio performance is recorded from
-    Adjusted Close after EOD.
+    Ordinary intraday prices versus the previous official EOD
+    price basis. Official daily portfolio performance uses
+    raw price change plus cash distributions; distributions
+    are not reinvested.
     </div>
     """,
     unsafe_allow_html=True

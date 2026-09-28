@@ -3,7 +3,6 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 from pathlib import Path
-from datetime import datetime
 from zoneinfo import ZoneInfo
 
 SAST = ZoneInfo("Africa/Johannesburg")
@@ -11,6 +10,20 @@ SAST = ZoneInfo("Africa/Johannesburg")
 PORTFOLIO_START = pd.Timestamp("2026-09-28")
 NAV_FILE = Path("portfolio_history.csv")
 BASIS_FILE = Path("portfolio_basis.csv")
+
+# ============================================================
+# BHETNC SPECIAL HANDLING
+#
+# Yahoo historical data begins only on 28 Sep 2026.
+# Actual verified 25 Sep 2026 close from broker reconciliation:
+# 2,391 cents = R23.91.
+#
+# From 28 Sep onward we use the actual BHETNC.JO instrument.
+# ============================================================
+
+BHETNC_PREVIOUS_DATE = pd.Timestamp("2026-09-25")
+BHETNC_PREVIOUS_CLOSE = 2391.0
+
 
 
 # ============================================================
@@ -47,58 +60,203 @@ portfolio = {
     "Satrix S&P 500 Feeder": ("STX500.JO", 210, "Subset"),
 }
 
-holdings = pd.DataFrame(
-    [
-        {
-            "Holding": name,
-            "Ticker": values[0],
-            "Qty": values[1],
-            "Bucket": values[2]
-        }
-        for name, values in portfolio.items()
-    ]
-)
+
+holdings = pd.DataFrame([
+    {
+        "Holding": name,
+        "Ticker": values[0],
+        "Qty": values[1],
+        "Bucket": values[2],
+    }
+    for name, values in portfolio.items()
+])
 
 tickers = holdings["Ticker"].tolist()
 
 
 # ============================================================
-# DOWNLOAD DAILY DATA
+# PRICE-UNIT REPAIR
+#
+# Same regime logic validated in historical audit.
 # ============================================================
 
-print("Downloading daily Yahoo data...")
+def repair_100x_regimes(series):
 
-raw = yf.download(
-    tickers,
-    period="10d",
-    interval="1d",
-    auto_adjust=False,
-    progress=False,
-    threads=True
-)
+    s = series.copy().astype(float)
 
-if not isinstance(raw.columns, pd.MultiIndex):
-    raise RuntimeError("Unexpected Yahoo column structure.")
+    if len(s) < 2:
+        return s
 
-if "Adj Close" not in raw.columns.get_level_values(0):
-    raise RuntimeError("Adjusted Close unavailable.")
+    repaired = s.copy()
+    scale = 1.0
 
-adj = raw["Adj Close"].copy()
-close = raw["Close"].copy()
+    for i in range(1, len(s)):
+
+        raw_prev = s.iloc[i - 1]
+        raw_curr = s.iloc[i]
+
+        if (
+            not np.isfinite(raw_prev)
+            or not np.isfinite(raw_curr)
+            or raw_prev <= 0
+            or raw_curr <= 0
+        ):
+            repaired.iloc[i] = raw_curr * scale
+            continue
+
+        raw_ratio = raw_curr / raw_prev
+
+        if 0.005 <= raw_ratio <= 0.02:
+            scale *= 100.0
+
+        elif 50 <= raw_ratio <= 200:
+            scale /= 100.0
+
+        repaired.iloc[i] = raw_curr * scale
+
+    return repaired
 
 
 # ============================================================
-# CURRENT EOD DATE
+# DOWNLOAD EACH HOLDING
+#
+# We deliberately use:
+#
+#   auto_adjust=False
+#   actions=True
+#   repair=False
+#
+# because OUR validated engine controls the reconstruction.
 # ============================================================
 
-dates = adj.dropna(how="all").index.sort_values()
+print("Downloading raw Yahoo prices and corporate actions...")
 
-if len(dates) < 1:
-    raise RuntimeError("No daily observations available.")
+security_data = {}
 
-current_date = pd.Timestamp(dates[-1]).normalize()
+for ticker in tickers:
 
-print("Current trading date:", current_date.date())
+    hist = yf.Ticker(ticker).history(
+        period="10d",
+        interval="1d",
+        auto_adjust=False,
+        actions=True,
+        repair=False
+    ).sort_index()
+
+    if hist.empty:
+        raise RuntimeError(
+            f"STOP — no Yahoo history for {ticker}"
+        )
+
+    if hist.index.tz is not None:
+        hist.index = hist.index.tz_localize(None)
+
+    if "Close" not in hist.columns:
+        raise RuntimeError(
+            f"STOP — Close unavailable for {ticker}"
+        )
+
+    close_raw = pd.to_numeric(
+        hist["Close"],
+        errors="coerce"
+    )
+
+    # --------------------------------------------------------
+    # PRICE NORMALISATION
+    # --------------------------------------------------------
+
+    # STXCAP's historical structural problem predates the
+    # progression portfolio. From portfolio inception onward
+    # it is already in the current price convention.
+    #
+    # Therefore NO old-history x100 adjustment is required
+    # for the live EOD engine.
+
+    close = repair_100x_regimes(
+        close_raw
+    )
+
+    # --------------------------------------------------------
+    # CASH DISTRIBUTIONS
+    # --------------------------------------------------------
+
+    if "Dividends" in hist.columns:
+
+        dividends = pd.to_numeric(
+            hist["Dividends"],
+            errors="coerce"
+        ).fillna(0.0)
+
+    else:
+
+        dividends = pd.Series(
+            0.0,
+            index=hist.index
+        )
+
+    # --------------------------------------------------------
+    # SPLITS
+    # --------------------------------------------------------
+
+    if "Stock Splits" in hist.columns:
+
+        splits = pd.to_numeric(
+            hist["Stock Splits"],
+            errors="coerce"
+        ).fillna(0.0)
+
+    else:
+
+        splits = pd.Series(
+            0.0,
+            index=hist.index
+        )
+
+    security_data[ticker] = pd.DataFrame({
+        "Close": close,
+        "Dividend": dividends,
+        "Split": splits,
+    })
+
+
+# ============================================================
+# FIND PORTFOLIO'S TWO MOST RECENT TRADING DATES
+#
+# Do NOT require every ticker to share every date.
+# Individual coverage is checked below.
+# ============================================================
+
+all_dates = set()
+
+for ticker, df in security_data.items():
+
+    valid = df.index[
+        df["Close"].notna()
+    ]
+
+    all_dates.update(valid)
+
+
+if len(all_dates) < 2:
+    raise RuntimeError(
+        "STOP — fewer than two trading dates available."
+    )
+
+
+dates = sorted(all_dates)
+
+current_date = pd.Timestamp(
+    dates[-1]
+).normalize()
+
+previous_date = pd.Timestamp(
+    dates[-2]
+).normalize()
+
+
+print("Previous trading date:", previous_date.date())
+print("Current trading date: ", current_date.date())
+
 
 if current_date < PORTFOLIO_START:
     raise RuntimeError(
@@ -107,241 +265,363 @@ if current_date < PORTFOLIO_START:
 
 
 # ============================================================
-# CURRENT EOD ADJUSTED-CLOSE BASIS
+# SECURITY RETURNS
+#
+# NON-REINVESTED:
+#
+# P&L =
+#     Qty × (P1 - P0 + cash distribution)
+#
+# Return =
+#     P&L / opening market value
+#
+# Because Yahoo JSE prices and dividends are both in the same
+# quote convention, the /100 conversion cancels from the
+# security return.
 # ============================================================
 
-basis_rows = []
+rows = []
+
 
 for _, h in holdings.iterrows():
 
     ticker = h["Ticker"]
+    qty = float(h["Qty"])
 
-    if ticker not in adj.columns:
-        raise RuntimeError(
-            f"STOP — {ticker} absent from Yahoo response."
+    df = security_data[ticker]
+
+    # ========================================================
+    # BHETNC SPECIAL CASE
+    # ========================================================
+
+    if ticker == "BHETNC.JO":
+
+        if current_date not in df.index:
+            raise RuntimeError(
+                "STOP — current BHETNC.JO market price unavailable."
+            )
+
+        # Seed only the verified pre-inception previous close.
+        if previous_date == BHETNC_PREVIOUS_DATE:
+            prev_close = BHETNC_PREVIOUS_CLOSE
+
+        elif previous_date in df.index:
+            prev_close = float(
+                df.loc[previous_date, "Close"]
+            )
+
+        else:
+            raise RuntimeError(
+                f"STOP — BHETNC previous close unavailable "
+                f"for {previous_date.date()}."
+            )
+
+        curr_close = float(
+            df.loc[current_date, "Close"]
         )
 
-    curr_adj = adj.loc[current_date, ticker]
-
-    if pd.isna(curr_adj):
-        raise RuntimeError(
-            f"STOP — no EOD adjusted close for {ticker}"
+        dividend = float(
+            df.loc[current_date, "Dividend"]
         )
 
-    # Yahoo JSE instruments quoted in cents.
-    basis_price = float(curr_adj / 100)
+    # ========================================================
+    # ALL OTHER HOLDINGS
+    # ========================================================
 
-    basis_rows.append({
-        "Date": current_date,
+    else:
+
+        if (
+            previous_date not in df.index
+            or current_date not in df.index
+        ):
+            raise RuntimeError(
+                f"STOP — required dates unavailable for {ticker}"
+            )
+
+        prev_close = float(
+            df.loc[previous_date, "Close"]
+        )
+
+        curr_close = float(
+            df.loc[current_date, "Close"]
+        )
+
+        dividend = float(
+            df.loc[current_date, "Dividend"]
+        )
+
+
+    # ========================================================
+    # HARD DATA CONTROLS
+    # ========================================================
+
+    if (
+        not np.isfinite(prev_close)
+        or not np.isfinite(curr_close)
+        or prev_close <= 0
+        or curr_close <= 0
+    ):
+        raise RuntimeError(
+            f"STOP — invalid price for {ticker}"
+        )
+
+
+    price_ratio = (
+        curr_close / prev_close
+    )
+
+    if (
+        price_ratio > 5.0
+        or price_ratio < 0.20
+    ):
+        raise RuntimeError(
+            f"STOP — unresolved price discontinuity "
+            f"for {ticker}: "
+            f"{prev_close:.4f} -> {curr_close:.4f}"
+        )
+
+
+    if dividend < 0:
+        raise RuntimeError(
+            f"STOP — negative distribution for {ticker}"
+        )
+
+
+    if dividend > 0:
+
+        distribution_ratio = (
+            dividend / curr_close
+        )
+
+        if distribution_ratio > 0.25:
+            raise RuntimeError(
+                f"STOP — suspicious distribution for {ticker}: "
+                f"{dividend:.4f} vs price {curr_close:.4f}"
+            )
+
+
+    # ========================================================
+    # SPLIT CONTROL
+    # ========================================================
+
+    split = float(
+        df.loc[current_date, "Split"]
+    )
+
+    if split != 0:
+
+        raise RuntimeError(
+            f"STOP — stock split detected for {ticker} "
+            f"on {current_date.date()}: {split}. "
+            f"Manual quantity verification required."
+        )
+
+
+    # ========================================================
+    # NON-REINVESTED RETURN
+    # ========================================================
+
+    price_return = (
+        curr_close / prev_close
+    ) - 1.0
+
+    total_return = (
+        curr_close
+        - prev_close
+        + dividend
+    ) / prev_close
+
+
+    # ========================================================
+    # OPENING ECONOMIC VALUE
+    #
+    # Yahoo JSE securities are quoted in cents.
+    # ========================================================
+
+    opening_value = (
+        qty * prev_close / 100.0
+    )
+
+    price_pnl = (
+        qty
+        * (curr_close - prev_close)
+        / 100.0
+    )
+
+    dividend_cash = (
+        qty
+        * dividend
+        / 100.0
+    )
+
+    total_pnl = (
+        price_pnl
+        + dividend_cash
+    )
+
+
+    rows.append({
         "Holding": h["Holding"],
         "Ticker": ticker,
         "Bucket": h["Bucket"],
-        "Qty": float(h["Qty"]),
-        "Adjusted_Basis": basis_price
+        "Qty": qty,
+
+        "Previous_Close": prev_close,
+        "Current_Close": curr_close,
+
+        "Dividend_per_Unit": dividend,
+
+        "Opening_Value": opening_value,
+
+        "Price_Return": price_return,
+        "Total_Return": total_return,
+
+        "Price_PnL": price_pnl,
+        "Dividend_Cash": dividend_cash,
+        "Total_PnL": total_pnl,
     })
 
-current_basis = pd.DataFrame(basis_rows)
 
-if len(current_basis) != len(holdings):
-    raise RuntimeError(
-        "STOP — current EOD basis does not contain every holding."
-    )
+detail = pd.DataFrame(rows)
 
 
 # ============================================================
-# INCEPTION DAY
-#
-# 28 Sep 2026 establishes the official portfolio basis.
-# There is deliberately NO portfolio return on inception day.
+# COVERAGE
 # ============================================================
 
-if not BASIS_FILE.exists():
+expected = set(tickers)
+received = set(detail["Ticker"])
 
-    current_basis.to_csv(BASIS_FILE, index=False)
-
-    print()
-    print("=" * 90)
-    print("PORTFOLIO INCEPTION BASIS ESTABLISHED")
-    print("=" * 90)
-    print(f"Basis date: {current_date.date()}")
-    print(f"Holdings:   {len(current_basis)}")
-    print()
-    print("No portfolio return recorded on inception day.")
-    print("Tomorrow's return will be measured from this adjusted-close basis.")
-
-    raise SystemExit(0)
-
-
-# ============================================================
-# LOAD PRIOR OFFICIAL EOD BASIS
-# ============================================================
-
-prior_basis = pd.read_csv(
-    BASIS_FILE,
-    parse_dates=["Date"]
+missing = sorted(
+    expected - received
 )
 
-required_cols = {
-    "Date", "Holding", "Ticker",
-    "Bucket", "Qty", "Adjusted_Basis"
-}
-
-missing_cols = required_cols - set(prior_basis.columns)
-
-if missing_cols:
+if missing:
     raise RuntimeError(
-        "STOP — portfolio_basis.csv missing columns: "
-        + ", ".join(sorted(missing_cols))
+        "STOP — missing holdings: "
+        + ", ".join(missing)
     )
-
-prior_basis["Date"] = pd.to_datetime(
-    prior_basis["Date"]
-).dt.normalize()
-
-prior_date = prior_basis["Date"].max()
-
-prior_basis = prior_basis[
-    prior_basis["Date"] == prior_date
-].copy()
-
-print("Prior official basis date:", prior_date.date())
-
-
-# Do not create a duplicate daily return if rerun on same EOD date.
-if current_date <= prior_date:
-
-    print()
-    print(
-        f"No new trading day to record. "
-        f"Current EOD={current_date.date()}, "
-        f"stored basis={prior_date.date()}."
-    )
-
-    raise SystemExit(0)
-
-
-# ============================================================
-# COVERAGE CHECK
-# ============================================================
-
-expected = set(holdings["Ticker"])
-
-prior_received = set(prior_basis["Ticker"])
-current_received = set(current_basis["Ticker"])
-
-missing_prior = sorted(expected - prior_received)
-missing_current = sorted(expected - current_received)
-
-if missing_prior:
-    raise RuntimeError(
-        "STOP — holdings missing from prior basis: "
-        + ", ".join(missing_prior)
-    )
-
-if missing_current:
-    raise RuntimeError(
-        "STOP — holdings missing from current basis: "
-        + ", ".join(missing_current)
-    )
-
-
-# ============================================================
-# DAILY SECURITY RETURNS
-#
-# Official return:
-# current EOD adjusted close / prior official adjusted basis - 1
-# ============================================================
-
-detail = prior_basis.merge(
-    current_basis[
-        ["Ticker", "Adjusted_Basis"]
-    ].rename(
-        columns={"Adjusted_Basis": "Current_Adjusted_Basis"}
-    ),
-    on="Ticker",
-    how="left",
-    validate="one_to_one"
-)
-
-detail["Total_Return"] = (
-    detail["Current_Adjusted_Basis"]
-    /
-    detail["Adjusted_Basis"]
-    - 1
-)
-
-# Beginning-of-day economic value based on prior adjusted basis.
-detail["Opening_Value"] = (
-    detail["Qty"]
-    *
-    detail["Adjusted_Basis"]
-)
 
 
 # ============================================================
 # PORTFOLIO RETURN
+#
+# Explicit P&L / opening capital.
+#
+# This is economically identical to beginning-value weighting
+# the individual non-reinvested returns, but easier to audit.
 # ============================================================
 
 def calc_portfolio_return(df):
 
-    capital = df["Opening_Value"].sum()
+    capital = float(
+        df["Opening_Value"].sum()
+    )
+
+    pnl = float(
+        df["Total_PnL"].sum()
+    )
 
     if capital <= 0:
-        raise RuntimeError(
-            "STOP — non-positive opening portfolio value."
-        )
+        return np.nan
 
-    pnl = (
-        df["Opening_Value"]
-        *
-        df["Total_Return"]
-    ).sum()
-
-    return float(pnl / capital)
+    return pnl / capital
 
 
-combined_return = calc_portfolio_return(detail)
+combined_return = calc_portfolio_return(
+    detail
+)
 
 main_return = calc_portfolio_return(
-    detail[detail["Bucket"] == "Main"]
+    detail[
+        detail["Bucket"] == "Main"
+    ]
 )
 
 subset_return = calc_portfolio_return(
-    detail[detail["Bucket"] == "Subset"]
+    detail[
+        detail["Bucket"] == "Subset"
+    ]
 )
 
+
+# ============================================================
+# AUDIT TABLE
+# ============================================================
+
+audit = detail[[
+    "Holding",
+    "Ticker",
+    "Opening_Value",
+    "Previous_Close",
+    "Current_Close",
+    "Dividend_per_Unit",
+    "Price_Return",
+    "Total_Return",
+    "Price_PnL",
+    "Dividend_Cash",
+    "Total_PnL",
+]].copy()
+
+
+print()
+print("=" * 140)
+print("SECURITY RETURN AUDIT — NON-REINVESTED")
+print("=" * 140)
+
+display_audit = audit.copy()
+
+for col in [
+    "Price_Return",
+    "Total_Return",
+]:
+    display_audit[col] = (
+        display_audit[col]
+        .map(lambda x: f"{x:+.4%}")
+    )
+
+for col in [
+    "Opening_Value",
+    "Previous_Close",
+    "Current_Close",
+    "Dividend_per_Unit",
+    "Price_PnL",
+    "Dividend_Cash",
+    "Total_PnL",
+]:
+    display_audit[col] = (
+        display_audit[col]
+        .map(lambda x: f"{x:,.2f}")
+    )
+
+print(
+    display_audit.to_string(
+        index=False
+    )
+)
+
+
+# ============================================================
+# OFFICIAL EOD OUTPUT
+# ============================================================
 
 print()
 print("=" * 90)
 print("OFFICIAL EOD PORTFOLIO RETURN")
 print("=" * 90)
 
-print(f"Prior basis: {prior_date.date()}")
-print(f"Date:        {current_date.date()}")
-print(f"Combined:    {combined_return:+.4%}")
-print(f"Main:        {main_return:+.4%}")
-print(f"Subset:      {subset_return:+.4%}")
+print(f"Date:      {current_date.date()}")
+print(f"Combined:  {combined_return:+.4%}")
+print(f"Main:      {main_return:+.4%}")
+print(f"Subset:    {subset_return:+.4%}")
 
 print()
-print("Returns use the stored prior-EOD adjusted-close basis.")
-print()
-
-
-# ============================================================
-# SAVE CURRENT ADJUSTED CLOSE AS NEXT-DAY BASIS
-# ============================================================
-
-current_basis.to_csv(
-    BASIS_FILE,
-    index=False
-)
-
-print("Next-day adjusted-close basis saved.")
 print(
-    f"Basis date: {current_date.date()} | "
-    f"Holdings: {len(current_basis)}"
+    "Method: raw price change + cash distributions; "
+    "distributions are NOT reinvested."
 )
 print()
+
 
 # ============================================================
 # SAVE / UPDATE HISTORY
@@ -351,7 +631,7 @@ new_row = pd.DataFrame([{
     "Date": current_date,
     "Combined": combined_return,
     "Main": main_return,
-    "Subset": subset_return
+    "Subset": subset_return,
 }])
 
 
@@ -392,12 +672,21 @@ history.to_csv(
 
 
 # ============================================================
-# CUMULATIVE RETURN
+# CUMULATIVE PROGRESSION RETURN
+#
+# Daily portfolio returns compound through time.
+#
+# This does NOT mean individual cash dividends are assumed
+# reinvested into the securities.
 # ============================================================
 
 cum = history.copy()
 
-for col in ["Combined", "Main", "Subset"]:
+for col in [
+    "Combined",
+    "Main",
+    "Subset",
+]:
 
     cum[col] = (
         (1 + cum[col])
@@ -412,12 +701,23 @@ print("=" * 90)
 
 display_history = history.copy()
 
-for col in ["Combined", "Main", "Subset"]:
-    display_history[col] = display_history[col].map(
-        lambda x: f"{x:+.4%}"
+for col in [
+    "Combined",
+    "Main",
+    "Subset",
+]:
+
+    display_history[col] = (
+        display_history[col]
+        .map(lambda x: f"{x:+.4%}")
     )
 
-print(display_history.to_string(index=False))
+
+print(
+    display_history.to_string(
+        index=False
+    )
+)
 
 
 print()
@@ -427,9 +727,150 @@ print("=" * 90)
 
 latest = cum.iloc[-1]
 
-print(f"Combined: {latest['Combined']:+.4%}")
-print(f"Main:     {latest['Main']:+.4%}")
-print(f"Subset:   {latest['Subset']:+.4%}")
+print(
+    f"Combined: {latest['Combined']:+.4%}"
+)
+
+print(
+    f"Main:     {latest['Main']:+.4%}"
+)
+
+print(
+    f"Subset:   {latest['Subset']:+.4%}"
+)
 
 print()
-print("portfolio_history.csv updated successfully.")
+print(
+    "portfolio_history.csv updated successfully."
+)
+
+
+# ============================================================
+# CORRECTED NON-REINVESTED EOD BASIS
+#
+# Today's ordinary closing price becomes tomorrow's intraday
+# price basis.
+#
+# Dividends are NOT embedded in this basis.
+# Any cash distribution was already recognised explicitly in
+# today's official EOD portfolio return.
+# ============================================================
+
+basis_rows = []
+
+for _, row in detail.iterrows():
+
+    basis_rows.append({
+
+        "Date":
+            current_date,
+
+        "Holding":
+            row["Holding"],
+
+        "Ticker":
+            row["Ticker"],
+
+        "Bucket":
+            row["Bucket"],
+
+        "Qty":
+            float(row["Qty"]),
+
+        # Convert Yahoo JSE cents -> rand.
+        "Price_Basis":
+            float(row["Current_Close"]) / 100.0
+    })
+
+
+current_basis = pd.DataFrame(
+    basis_rows
+)
+
+
+# ------------------------------------------------------------
+# COVERAGE CONTROL
+# ------------------------------------------------------------
+
+expected_basis = set(
+    holdings["Ticker"]
+)
+
+received_basis = set(
+    current_basis["Ticker"]
+)
+
+missing_basis = sorted(
+    expected_basis - received_basis
+)
+
+if missing_basis:
+
+    raise RuntimeError(
+        "STOP — cannot write next-day basis. Missing: "
+        + ", ".join(missing_basis)
+    )
+
+
+if len(current_basis) != len(holdings):
+
+    raise RuntimeError(
+        "STOP — next-day basis row count does not "
+        "match portfolio holdings."
+    )
+
+
+# ------------------------------------------------------------
+# PRICE CONTROL
+# ------------------------------------------------------------
+
+if (
+    current_basis["Price_Basis"].isna().any()
+    or
+    (current_basis["Price_Basis"] <= 0).any()
+):
+
+    raise RuntimeError(
+        "STOP — invalid price in next-day basis."
+    )
+
+
+# ------------------------------------------------------------
+# WRITE
+# ------------------------------------------------------------
+
+current_basis.to_csv(
+    BASIS_FILE,
+    index=False
+)
+
+
+print()
+print("=" * 90)
+print("NEXT-DAY INTRADAY BASIS")
+print("=" * 90)
+
+print(
+    current_basis[
+        [
+            "Ticker",
+            "Qty",
+            "Price_Basis"
+        ]
+    ].to_string(
+        index=False,
+        float_format=lambda x: f"{x:,.2f}"
+    )
+)
+
+print()
+print(
+    f"portfolio_basis.csv saved for "
+    f"{current_date.date()}."
+)
+
+print(
+    "Basis = ordinary EOD Close. "
+    "Cash distributions are accounted for separately "
+    "in official EOD return."
+)
