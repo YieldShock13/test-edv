@@ -88,20 +88,17 @@ close = raw["Close"].copy()
 
 
 # ============================================================
-# FIND TWO MOST RECENT COMPLETE TRADING DATES
+# CURRENT EOD DATE
 # ============================================================
 
 dates = adj.dropna(how="all").index.sort_values()
 
-if len(dates) < 2:
-    raise RuntimeError("Not enough daily observations.")
+if len(dates) < 1:
+    raise RuntimeError("No daily observations available.")
 
 current_date = pd.Timestamp(dates[-1]).normalize()
-previous_date = pd.Timestamp(dates[-2]).normalize()
 
-print("Previous trading date:", previous_date.date())
-print("Current trading date: ", current_date.date())
-
+print("Current trading date:", current_date.date())
 
 if current_date < PORTFOLIO_START:
     raise RuntimeError(
@@ -110,76 +107,179 @@ if current_date < PORTFOLIO_START:
 
 
 # ============================================================
-# CALCULATE SECURITY TOTAL RETURNS
+# CURRENT EOD ADJUSTED-CLOSE BASIS
 # ============================================================
 
-rows = []
+basis_rows = []
 
 for _, h in holdings.iterrows():
 
     ticker = h["Ticker"]
 
     if ticker not in adj.columns:
-        print(f"WARNING: {ticker} missing.")
-        continue
+        raise RuntimeError(
+            f"STOP — {ticker} absent from Yahoo response."
+        )
 
-    prev_adj = adj.loc[previous_date, ticker]
     curr_adj = adj.loc[current_date, ticker]
 
-    prev_close = close.loc[previous_date, ticker]
-    curr_close = close.loc[current_date, ticker]
+    if pd.isna(curr_adj):
+        raise RuntimeError(
+            f"STOP — no EOD adjusted close for {ticker}"
+        )
 
-    if pd.isna(prev_adj) or pd.isna(curr_adj):
-        print(f"WARNING: {ticker} missing adjusted close.")
-        continue
+    # Yahoo JSE instruments quoted in cents.
+    basis_price = float(curr_adj / 100)
 
-    # Yahoo JSE quote units are immaterial for returns.
-    total_return = float(curr_adj / prev_adj - 1)
-
-    # Beginning-of-day economic value.
-    #
-    # We use previous ordinary close × quantity to establish
-    # actual portfolio capital at risk at the beginning of day.
-    #
-    # Unit conversion /100 because Yahoo JSE prices are quoted
-    # in cents for these instruments.
-    opening_value = float(h["Qty"] * prev_close / 100)
-
-    rows.append({
+    basis_rows.append({
+        "Date": current_date,
         "Holding": h["Holding"],
         "Ticker": ticker,
         "Bucket": h["Bucket"],
-        "Qty": h["Qty"],
-        "Opening_Value": opening_value,
-        "Total_Return": total_return
+        "Qty": float(h["Qty"]),
+        "Adjusted_Basis": basis_price
     })
 
+current_basis = pd.DataFrame(basis_rows)
 
-detail = pd.DataFrame(rows)
+if len(current_basis) != len(holdings):
+    raise RuntimeError(
+        "STOP — current EOD basis does not contain every holding."
+    )
 
-if detail.empty:
-    raise RuntimeError("No valid holdings.")
+
+# ============================================================
+# INCEPTION DAY
+#
+# 28 Sep 2026 establishes the official portfolio basis.
+# There is deliberately NO portfolio return on inception day.
+# ============================================================
+
+if not BASIS_FILE.exists():
+
+    current_basis.to_csv(BASIS_FILE, index=False)
+
+    print()
+    print("=" * 90)
+    print("PORTFOLIO INCEPTION BASIS ESTABLISHED")
+    print("=" * 90)
+    print(f"Basis date: {current_date.date()}")
+    print(f"Holdings:   {len(current_basis)}")
+    print()
+    print("No portfolio return recorded on inception day.")
+    print("Tomorrow's return will be measured from this adjusted-close basis.")
+
+    raise SystemExit(0)
+
+
+# ============================================================
+# LOAD PRIOR OFFICIAL EOD BASIS
+# ============================================================
+
+prior_basis = pd.read_csv(
+    BASIS_FILE,
+    parse_dates=["Date"]
+)
+
+required_cols = {
+    "Date", "Holding", "Ticker",
+    "Bucket", "Qty", "Adjusted_Basis"
+}
+
+missing_cols = required_cols - set(prior_basis.columns)
+
+if missing_cols:
+    raise RuntimeError(
+        "STOP — portfolio_basis.csv missing columns: "
+        + ", ".join(sorted(missing_cols))
+    )
+
+prior_basis["Date"] = pd.to_datetime(
+    prior_basis["Date"]
+).dt.normalize()
+
+prior_date = prior_basis["Date"].max()
+
+prior_basis = prior_basis[
+    prior_basis["Date"] == prior_date
+].copy()
+
+print("Prior official basis date:", prior_date.date())
+
+
+# Do not create a duplicate daily return if rerun on same EOD date.
+if current_date <= prior_date:
+
+    print()
+    print(
+        f"No new trading day to record. "
+        f"Current EOD={current_date.date()}, "
+        f"stored basis={prior_date.date()}."
+    )
+
+    raise SystemExit(0)
 
 
 # ============================================================
 # COVERAGE CHECK
 # ============================================================
 
-expected = set(tickers)
-received = set(detail["Ticker"])
+expected = set(holdings["Ticker"])
 
-missing = sorted(expected - received)
+prior_received = set(prior_basis["Ticker"])
+current_received = set(current_basis["Ticker"])
 
-if missing:
+missing_prior = sorted(expected - prior_received)
+missing_current = sorted(expected - current_received)
+
+if missing_prior:
     raise RuntimeError(
-        "STOP — missing holdings: " + ", ".join(missing)
+        "STOP — holdings missing from prior basis: "
+        + ", ".join(missing_prior)
+    )
+
+if missing_current:
+    raise RuntimeError(
+        "STOP — holdings missing from current basis: "
+        + ", ".join(missing_current)
     )
 
 
 # ============================================================
-# PORTFOLIO RETURN
+# DAILY SECURITY RETURNS
 #
-# Beginning-of-day market-value weighting.
+# Official return:
+# current EOD adjusted close / prior official adjusted basis - 1
+# ============================================================
+
+detail = prior_basis.merge(
+    current_basis[
+        ["Ticker", "Adjusted_Basis"]
+    ].rename(
+        columns={"Adjusted_Basis": "Current_Adjusted_Basis"}
+    ),
+    on="Ticker",
+    how="left",
+    validate="one_to_one"
+)
+
+detail["Total_Return"] = (
+    detail["Current_Adjusted_Basis"]
+    /
+    detail["Adjusted_Basis"]
+    - 1
+)
+
+# Beginning-of-day economic value based on prior adjusted basis.
+detail["Opening_Value"] = (
+    detail["Qty"]
+    *
+    detail["Adjusted_Basis"]
+)
+
+
+# ============================================================
+# PORTFOLIO RETURN
 # ============================================================
 
 def calc_portfolio_return(df):
@@ -187,15 +287,17 @@ def calc_portfolio_return(df):
     capital = df["Opening_Value"].sum()
 
     if capital <= 0:
-        return np.nan
+        raise RuntimeError(
+            "STOP — non-positive opening portfolio value."
+        )
 
-    pnl_equivalent = (
+    pnl = (
         df["Opening_Value"]
         *
         df["Total_Return"]
     ).sum()
 
-    return float(pnl_equivalent / capital)
+    return float(pnl / capital)
 
 
 combined_return = calc_portfolio_return(detail)
@@ -209,77 +311,35 @@ subset_return = calc_portfolio_return(
 )
 
 
-# ============================================================
-# OUTPUT
-# ============================================================
-
 print()
 print("=" * 90)
 print("OFFICIAL EOD PORTFOLIO RETURN")
 print("=" * 90)
 
-print(f"Date:      {current_date.date()}")
-print(f"Combined:  {combined_return:+.4%}")
-print(f"Main:      {main_return:+.4%}")
-print(f"Subset:    {subset_return:+.4%}")
+print(f"Prior basis: {prior_date.date()}")
+print(f"Date:        {current_date.date()}")
+print(f"Combined:    {combined_return:+.4%}")
+print(f"Main:        {main_return:+.4%}")
+print(f"Subset:      {subset_return:+.4%}")
 
 print()
-print("These are Adjusted-Close total returns.")
+print("Returns use the stored prior-EOD adjusted-close basis.")
 print()
-
 
 
 # ============================================================
-# SAVE OFFICIAL EOD BASIS FOR NEXT TRADING DAY
-#
-# This is the ONLY basis used by tomorrow's live dashboard.
-# Adjusted Close captures distributions / corporate actions.
+# SAVE CURRENT ADJUSTED CLOSE AS NEXT-DAY BASIS
 # ============================================================
 
-basis_rows = []
-
-for _, h in holdings.iterrows():
-
-    ticker = h["Ticker"]
-
-    curr_adj = adj.loc[current_date, ticker]
-
-    if pd.isna(curr_adj):
-        raise RuntimeError(
-            f"STOP — no EOD adjusted close for {ticker}"
-        )
-
-    # Yahoo JSE instruments are quoted in cents.
-    basis_price = float(curr_adj / 100)
-
-    basis_rows.append({
-        "Date": current_date,
-        "Holding": h["Holding"],
-        "Ticker": ticker,
-        "Bucket": h["Bucket"],
-        "Qty": float(h["Qty"]),
-        "Adjusted_Basis": basis_price
-    })
-
-
-basis = pd.DataFrame(basis_rows)
-
-if len(basis) != len(holdings):
-    raise RuntimeError(
-        "STOP — EOD basis does not contain every holding."
-    )
-
-basis.to_csv(
+current_basis.to_csv(
     BASIS_FILE,
     index=False
 )
 
-print()
-print("Official next-day basis saved:")
-print(BASIS_FILE)
+print("Next-day adjusted-close basis saved.")
 print(
     f"Basis date: {current_date.date()} | "
-    f"Holdings: {len(basis)}"
+    f"Holdings: {len(current_basis)}"
 )
 print()
 
