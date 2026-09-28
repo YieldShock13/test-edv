@@ -774,7 +774,7 @@ else:
         go.Scatter(
             x=cumulative["Date"],
             y=cumulative[selected] * 100,
-            mode="lines",
+            mode="lines+markers" if len(cumulative) == 1 else "lines",
             name=selected,
             hovertemplate=(
                 "%{x|%d %b %Y}<br>"
@@ -931,8 +931,10 @@ else:
             - 1.0
         )
 
-        max_drawdown = float(
-            drawdown.min()
+        max_drawdown = (
+            float(drawdown.min())
+            if len(r) >= 2
+            else np.nan
         )
 
         trough_label = (
