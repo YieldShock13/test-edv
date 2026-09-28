@@ -46,7 +46,11 @@ jobs:
           git config user.name "portfolio-eod-bot"
           git config user.email "portfolio-eod-bot@users.noreply.github.com"
 
-          git add portfolio_history.csv portfolio_basis.csv
+          git add portfolio_basis.csv
+
+          if [ -f portfolio_history.csv ]; then
+            git add portfolio_history.csv
+          fi
 
           if git diff --cached --quiet; then
             echo "No EOD changes to commit."
