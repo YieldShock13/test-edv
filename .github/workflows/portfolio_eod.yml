@@ -52,6 +52,10 @@ jobs:
             git add portfolio_history.csv
           fi
 
+          if [ -f portfolio_return_composition.csv ]; then
+            git add portfolio_return_composition.csv
+          fi
+
           if git diff --cached --quiet; then
             echo "No EOD changes to commit."
           else
