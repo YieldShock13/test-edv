@@ -607,7 +607,7 @@ subset = portfolio_stats("Subset")
 # HEADER
 # ============================================================
 
-st.title("Portfolio Monitor")
+st.image("assets/orca_ribbon.webp", use_container_width=True)
 
 latest_timestamp = (
     live["Last_Update"].max()
